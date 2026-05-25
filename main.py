@@ -1,46 +1,112 @@
 from transformers import pipeline
 from pprint import pprint
+from pydantic import BaseModel, ConfigDict, SerializeAsAny
+from typing import Any, Callable, Generic, TypeVar
 
-class SmolLLM:
-    def __init__(self, model_name="HuggingFaceTB/SmolLM2-135M-Instruct"):
-        print(f"Loading {model_name} into memory. This may take a while...")
-        self.pipe = pipeline("text-generation", model=model_name)
-        print("Model loaded successful!")
+I = TypeVar("I")
+O = TypeVar("O")
+M = TypeVar("M")
+
+class Runnable(BaseModel, Generic[I, O]):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
     
-    def invoke(self, prompt: str) -> str:
-        messages = [{"role": "user", "content": prompt}]
-        output = self.pipe(messages, max_new_tokens=150)
-        return output[0]['generated_text'][-1]['content'].strip()
+    name: str | None = None
     
-class PromptTemplate:
-    def __init__(self, template_str: str):
-        self.template_str = template_str
+    def invoke(self, data: I) -> O:
+        raise NotImplementedError("Subclasses is not implemented")
+    
+    def __or__(self, other: Any) -> 'RunnableSequence':
+        if isinstance(other, Runnable):
+            return RunnableSequence.model_construct(
+                first=self, 
+                second=other,
+            )
+        if callable(other):
+            return RunnableSequence.model_construct(
+                first=self,
+                second=RunnableLambda.model_construct(func=other, name=other.__name__),
+                name=other.__name__,
+            )
+        return NotImplemented
+    
+    def __ror__(self, other: Any) -> Any:
+        if callable(other):
+            return RunnableSequence.model_construct(
+                first=RunnableLambda.model_construct(func=other),
+                second=self,
+                name=other.__name__,
+            )
+        return NotImplemented
+    
+class RunnableLambda(Runnable[I, O]):
+    func: Callable[[I], O]
+    
+    def invoke(self, data: I) -> O:
+        return self.func(data)
+    
+class RunnableSequence(Runnable[I, O], Generic[I, M, O]):
+    first: SerializeAsAny[Runnable[I, M]]
+    second: SerializeAsAny[Runnable[M, O]]
+    
+    def invoke(self, data: I) -> O:
+        return self.second.invoke(self.first.invoke(data))
+
+# Strongly typed input data
+class TicketInput(BaseModel):
+    customer_id: int
+    message: str
+
+# Strongly typed output data
+class ProcessedTicket(BaseModel):
+    customer_id: int
+    sentiment: str
+    urgency: str
+    summary: str
+
+class SentimentAnalyser(Runnable[TicketInput, dict]):
+    name: str = "sentiment_analyser"
+    model_version: str = "2.1-stable"
+    
+    def invoke(self, ticket: TicketInput) -> dict:
+        msg_lower = ticket.message.lower()
         
-    def format(self, **kwargs):
-        return self.template_str.format(**kwargs)
-    
-    def __or__(self, other):
-        if isinstance(other, SmolLLM):
-            return LLMChain(prompt_template=self, llm=other)
-        raise TypeError("A PromptTemplate can only be piped into LLMChain.")
-    
-class LLMChain:
-    def __init__(self, prompt_template: PromptTemplate, llm: SmolLLM):
-        self.prompt_template = prompt_template
-        self.llm = llm
+        # Simulated NLP sentiment
+        sentiment = "negative" if "broken" in msg_lower or "angry" in msg_lower else "neutral"
+        urgency = "high" if "broken" in msg_lower or "urgent" in msg_lower else "low"
         
-    def invoke(self, **kwargs) -> str:
-        formatted_prompt = self.prompt_template.format(**kwargs)
-        return self.llm.invoke(formatted_prompt)
+        return {
+            "customer_id": ticket.customer_id,
+            "sentiment": sentiment,
+            "urgency": urgency,
+            "summary": ticket.message[:40] + "..."
+        }
 
-llm = SmolLLM()
+class TicketParser(Runnable[dict, ProcessedTicket]):
+    name: str = "ticket_parser"
+    
+    def invoke(self, raw_dict: dict) -> ProcessedTicket:
+        return ProcessedTicket(**raw_dict)
 
-recipe_prompt = PromptTemplate(
-    template_str="Give me a quick 2-step recipe for a {dish} using only {ingredients_count} integredients. Think it through step by step and explain your reasoning."
+def route_ticket(ticket: ProcessedTicket) -> dict:
+    destination = "engineering_team" if "high" in ticket.urgency else "general_support"
+    return {
+        "status": "routed",
+        "assigned_to": destination,
+        "ticket_details": ticket.model_dump()
+    }
+
+ticket_pipeline = SentimentAnalyser() | TicketParser() | route_ticket
+
+incoming_ticket = TicketInput(
+    customer_id=1337,
+    message="The payment portal is broken! Urgent fix is needed ASAP!"
 )
 
-recipe_chain = recipe_prompt | llm
+final_output = ticket_pipeline.invoke(incoming_ticket)
 
-result = recipe_chain.invoke(dish="mud cake", ingredients_count="four")
+print("--- PIPELINE EXECUTION RESULT ---")
+pprint(final_output)
 
-pprint(result)
+print("--- INSIGHT: THE PYDANTIC SCHEMA OF THE PIPELINE ---")
+pprint(ticket_pipeline.model_dump(exclude_none=True))
+
